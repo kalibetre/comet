@@ -2211,13 +2211,13 @@ impl Shell {
             cx.background_executor()
                 .timer(Duration::from_millis(SAVE_DEBOUNCE_MS))
                 .await;
-            // Re-stamp the appearance from the global before writing. The View
-            // menu changes it through `appearance::set_mode`, which never touches
-            // this shell's in-memory copy — without this, the next pane resize
-            // would quietly write the boot-time appearance back over the user's
-            // choice.
+            // Re-stamp the appearance keys from the global before writing. The
+            // View menu / theme picker change them through `appearance::`, which
+            // never touches this shell's in-memory copy — without this, the next
+            // pane resize would quietly write the boot-time appearance (and the
+            // picked THEME) back over the user's choice.
             let Ok(snapshot) = this.update(cx, |shell, cx| {
-                shell.settings.appearance = crate::appearance::mode(cx);
+                crate::appearance::stamp_settings(&mut shell.settings, cx);
                 shell.settings.clone()
             }) else {
                 return;

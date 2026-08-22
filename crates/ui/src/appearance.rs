@@ -140,6 +140,21 @@ pub fn mode(cx: &App) -> AppearanceMode {
         .unwrap_or_default()
 }
 
+/// Copy the appearance keys from the [`AppearanceState`] global into `settings`
+/// so a full-struct save can't roll the user's theme back to boot-time values.
+/// The shell's debounced writer saves its whole in-memory [`UiSettings`] —
+/// without this re-stamp, any pane resize after picking a theme would quietly
+/// wipe `darkTheme`/`lightTheme` (and frost) from the file.
+pub fn stamp_settings(settings: &mut UiSettings, cx: &App) {
+    let Some(state) = cx.try_global::<AppearanceState>() else {
+        return;
+    };
+    settings.appearance = state.mode;
+    settings.dark_theme = state.dark_theme.clone();
+    settings.light_theme = state.light_theme.clone();
+    settings.frost_alpha = state.frost_alpha;
+}
+
 /// Change the user's preference, repaint if that changed the palette, and write
 /// the choice to disk.
 pub fn set_mode(mode: AppearanceMode, cx: &mut App) {

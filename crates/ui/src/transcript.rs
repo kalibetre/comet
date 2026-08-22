@@ -4527,7 +4527,12 @@ impl Transcript {
                                     .flex_none()
                                     .bg(crate::theme::hairline(0.06)),
                             )
-                            .child(detail_body(invocation, None, theme));
+                            .child(detail_body(
+                                invocation,
+                                &format!("{key}#inv"),
+                                None,
+                                theme,
+                            ));
                     }
                     if let Some(detail) = detail.as_deref() {
                         card = card
@@ -4537,7 +4542,12 @@ impl Transcript {
                                     .flex_none()
                                     .bg(crate::theme::hairline(0.06)),
                             )
-                            .child(detail_body(detail, detail_highlights[ix].clone(), theme));
+                            .child(detail_body(
+                                detail,
+                                &format!("{key}#out"),
+                                detail_highlights[ix].clone(),
+                                theme,
+                            ));
                     }
                     if let Some(ChipAffordance { blob_ref, label }) = affordance {
                         let loading = matches!(
@@ -4971,6 +4981,7 @@ fn tool_icon_path(call: &ToolCall) -> &'static str {
 /// lines, indentation intact, counted-tail truncation.
 fn detail_body(
     detail: &ToolDetail,
+    sel_prefix: &str,
     diff_highlights: Option<Arc<crate::changes::DiffHighlights>>,
     theme: &Theme,
 ) -> AnyElement {
@@ -5023,35 +5034,89 @@ fn detail_body(
         ToolDetail::Output {
             lines,
             truncated_by,
-        } => body
-            .py(px(6.0))
-            .font_family(theme.font_mono.clone())
-            .text_size(px(11.5))
-            .children(lines.iter().map(|line| {
-                div()
-                    .h(px(OUTPUT_LINE_HEIGHT))
-                    .w_full()
-                    .min_w_0()
-                    .px(px(12.0))
-                    .flex()
-                    .items_center()
-                    .text_color(theme.text.opacity(0.85))
-                    .child(div().w_full().min_w_0().truncate().child(line.clone()))
-            }))
-            .when(*truncated_by > 0, |block| {
-                block.child(
+        } => {
+            // Selection support: each output line registers into the markdown
+            // selection registry (same recipe as code-block lines), so drags
+            // select and Cmd+C copies tool output like any other text.
+            let font = gpui::font(theme.font_mono.clone());
+            let line_color = theme.text.opacity(0.85);
+            let sel_wash = render::selection_wash(theme);
+            body.py(px(6.0))
+                .font_family(theme.font_mono.clone())
+                .text_size(px(11.5))
+                .children(lines.iter().enumerate().map(|(li, line)| {
                     div()
                         .h(px(OUTPUT_LINE_HEIGHT))
+                        .w_full()
+                        .min_w_0()
                         .px(px(12.0))
                         .flex()
                         .items_center()
-                        .text_size(px(10.5))
-                        .text_color(theme.text_faint)
-                        .child(SharedString::from(format!("… {truncated_by} more lines"))),
-                )
-            })
-            .into_any_element(),
+                        .child(selectable_output_line(
+                            Arc::from(format!("{sel_prefix}:{li}")),
+                            line.clone(),
+                            font.clone(),
+                            line_color,
+                            sel_wash,
+                        ))
+                }))
+                .when(*truncated_by > 0, |block| {
+                    block.child(
+                        div()
+                            .h(px(OUTPUT_LINE_HEIGHT))
+                            .px(px(12.0))
+                            .flex()
+                            .items_center()
+                            .text_size(px(10.5))
+                            .text_color(theme.text_faint)
+                            .child(SharedString::from(format!("… {truncated_by} more lines"))),
+                    )
+                })
+                .into_any_element()
+        }
     }
+}
+
+/// One selectable mono output line — the same recipe as the markdown
+/// renderer's [`code_line_element`]: an underlay canvas paints the selection
+/// wash from this element's span and registers `(key, text, layout)` into the
+/// frame's document-ordered registry, so a drag selects across prose, code
+/// blocks, and tool output, and Cmd+C joins everything in document order.
+/// The line clips instead of wrapping (`truncate`), matching output-panel
+/// semantics; selection geometry still covers the full laid-out line.
+fn selectable_output_line(
+    sel_key: Arc<str>,
+    line: SharedString,
+    font: gpui::Font,
+    color: gpui::Hsla,
+    sel_wash: gpui::Hsla,
+) -> AnyElement {
+    let run = TextRun {
+        len: line.len(),
+        font,
+        color,
+        background_color: None,
+        underline: None,
+        strikethrough: None,
+    };
+    let styled = StyledText::new(line.clone()).with_runs(vec![run]);
+    let layout = styled.layout().clone();
+    let underlay = canvas(
+        |_, _, _| (),
+        move |_, _, window, _| {
+            render::paint_text_selection_with_wash(window, &sel_key, &line, &layout, sel_wash);
+        },
+    )
+    .absolute()
+    .size_full();
+    div()
+        .relative()
+        .w_full()
+        .min_w_0()
+        .truncate()
+        .child(underlay)
+        .child(styled)
+        .into_any_element()
 }
 
 /// The trailing tile on a chip header, when it has one.

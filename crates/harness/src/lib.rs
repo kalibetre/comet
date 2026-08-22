@@ -3,10 +3,12 @@
 //! NATIVE DRIVERS speak each agent's own wire directly: Claude Code over
 //! stream-json ([`ClaudeHarness`]), Codex over the app-server JSON-RPC
 //! ([`CodexHarness`]), Cursor through a pinned @cursor/sdk shim
-//! ([`CursorHarness`]) and Pi over its JSONL RPC mode ([`PiNativeHarness`]).
-//! The shared [`AcpHarness`] remains for agents built ground-up on ACP — Grok
-//! (`grok agent stdio`), Hermes (`hermes acp`) and opencode (`opencode acp`).
-//! Adapter-mediated ACP for claude/codex/cursor was retired: the
+//! ([`CursorHarness`]), Pi over its JSONL RPC mode ([`PiNativeHarness`]), and
+//! opencode over its own HTTP/SSE server protocol
+//! ([`OpencodeHarness`] — what the opencode desktop app speaks). The shared
+//! [`AcpHarness`] remains ONLY for agents built ground-up on ACP — Grok
+//! (`grok agent stdio`) and Hermes (`hermes acp`). Adapter-mediated ACP for
+//! claude/codex/cursor was retired — and opencode's ACP layer with it: the
 //! adapters held prompt turns open for background work the
 //! CLIs themselves settle eagerly, manufacturing done-status bugs the
 //! native wires don't have (decision record: docs/research/acp.md).
@@ -97,6 +99,7 @@ pub mod codex;
 pub mod cursor;
 pub(crate) mod jsonrpc;
 pub mod mock;
+pub mod opencode;
 pub mod pi;
 pub mod shell_env;
 
@@ -255,6 +258,7 @@ pub use acp::AcpHarness;
 pub use claude::ClaudeHarness;
 pub use codex::CodexHarness;
 pub use cursor::CursorHarness;
+pub use opencode::OpencodeHarness;
 pub use pi::PiNativeHarness;
 
 // ---------------------------------------------------------------------------

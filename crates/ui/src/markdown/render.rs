@@ -731,7 +731,7 @@ fn flat_text_element(
 }
 
 /// Selection tint: the accent hue under the glyphs, dark-panel strength.
-fn selection_wash(theme: &Theme) -> Hsla {
+pub(crate) fn selection_wash(theme: &Theme) -> Hsla {
     theme.accent.opacity(0.35) // indigo-400
 }
 
@@ -747,12 +747,26 @@ pub(crate) fn paint_text_selection(
     layout: &gpui::TextLayout,
     theme: &Theme,
 ) {
+    paint_text_selection_with_wash(window, key, text, layout, selection_wash(theme));
+}
+
+/// Theme-free core of [`paint_text_selection`] — callers that render many
+/// lines per frame (code blocks, tool output) compute the wash color once and
+/// move the copy into each line's paint closure instead of cloning the whole
+/// [`Theme`] per line.
+pub(crate) fn paint_text_selection_with_wash(
+    window: &mut Window,
+    key: &std::sync::Arc<str>,
+    text: &SharedString,
+    layout: &gpui::TextLayout,
+    sel_wash: Hsla,
+) {
     if let Some(range) = super::selection::wash_range(key) {
         for rect in range_rects(layout, &range, 0.0, 0.0) {
             window.paint_quad(quad(
                 rect,
                 px(0.0),
-                selection_wash(theme),
+                sel_wash,
                 px(0.0),
                 gpui::transparent_black(),
                 BorderStyle::default(),
@@ -1130,6 +1144,7 @@ fn render_code_block(
             )
             .when(copied, |el| el.child(SharedString::from("Copied")))
     });
+    let sel_wash = selection_wash(theme);
     div()
         .rounded(px(10.0))
         // Faint white wash over the near-black panel ≈ #101010 (zeron's code
@@ -1155,7 +1170,7 @@ fn render_code_block(
         })
         .child(
             div()
-                .id(scroll_id)
+                .id(scroll_id.clone())
                 .overflow_x_scroll()
                 .px(px(CODE_PADDING_X))
                 .py(px(CODE_PADDING_Y))
@@ -1171,16 +1186,50 @@ fn render_code_block(
                     *off = start + line.len() + 1; // +1 for the '\n'
                     let local = slice_spans(&veil_spans, start, start + line.len());
                     let runs = apply_veil(runs.clone(), &local);
-                    Some(
-                        div()
-                            .h(px(CODE_LINE_HEIGHT))
-                            .flex_none()
-                            .child(StyledText::new(line.clone()).with_runs(runs)),
-                    )
+                    Some(code_line_element(
+                        scroll_id.clone(),
+                        li,
+                        line.clone(),
+                        runs,
+                        sel_wash,
+                    ))
                 })),
         )
         // Overlay LAST so it paints above the header/body.
         .children(copy_button)
+        .into_any_element()
+}
+
+/// One code-block line enrolled in the text-selection system — the same
+/// recipe as [`flat_text_element`]: an underlay canvas paints the selection
+/// wash from the element's span and registers `(key, text, layout)` into the
+/// frame's document-ordered registry, so drags select across prose ↔ code
+/// lines and Cmd+C joins everything in order. The wash color is computed once
+/// per block (see [`paint_text_selection_with_wash`]).
+fn code_line_element(
+    scroll_id: SharedString,
+    li: usize,
+    line: SharedString,
+    runs: Vec<TextRun>,
+    sel_wash: Hsla,
+) -> AnyElement {
+    let styled = StyledText::new(line.clone()).with_runs(runs);
+    let layout = styled.layout().clone();
+    let sel_key: std::sync::Arc<str> = format!("{scroll_id}:{li}").into();
+    let underlay = canvas(
+        |_, _, _| (),
+        move |_, _, window, _| {
+            paint_text_selection_with_wash(window, &sel_key, &line, &layout, sel_wash);
+        },
+    )
+    .absolute()
+    .size_full();
+    div()
+        .relative()
+        .h(px(CODE_LINE_HEIGHT))
+        .flex_none()
+        .child(underlay)
+        .child(styled)
         .into_any_element()
 }
 

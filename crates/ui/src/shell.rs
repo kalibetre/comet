@@ -1945,7 +1945,29 @@ impl Shell {
                     cx,
                 );
             }
+            TranscriptEvent::OpenFile { path, line } => {
+                self.add_file_surface(path.clone(), *line, cx);
+            }
         }
+    }
+
+    /// Open a workspace-file link in the same Changes surface that powers Git
+    /// diffs. The surface keeps the checkout context, syntax highlighting, and
+    /// review-comment machinery in one place.
+    fn add_file_surface(&mut self, path: String, line: Option<u32>, cx: &mut Context<Self>) {
+        let initial_diff = match self.resolved_right_active(cx) {
+            RightSurface::Diff(id) => self
+                .diffs
+                .get(&id)
+                .and_then(|changes| changes.read(cx).checkout_snapshot(cx)),
+            _ => None,
+        };
+        if !self.right_pane_open(cx) {
+            self.toggle_right_pane(cx);
+        }
+        let changes =
+            cx.new(|cx| Changes::for_file(self.state.clone(), path, line, initial_diff, cx));
+        self.register_diff_surface(changes, cx);
     }
 
     /// A spawn chip's "Open subagent": focus the existing tab for that doc,

@@ -884,6 +884,144 @@ async fn checkout_file_diff_text_rpc_fits_the_default_worker_stack() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn checkout_file_diff_text_rpc_reads_direct_file_without_published_snapshot() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let repo_dir = tmp.path().join("repo");
+    init_repo(&repo_dir).await;
+    std::fs::write(repo_dir.join("a.txt"), "one\ntwo edited\n").expect("dirty tree");
+
+    let core = assemble(&tmp.path().join("data"));
+    let client = zeron_rpc::memory_client(core.rpc_service());
+    let response = client
+        .call(
+            methods::GET_CHECKOUT_FILE_DIFF_TEXT,
+            serde_json::json!({
+                "checkoutId": "",
+                "cwd": repo_dir,
+                "path": "a.txt",
+                "mode": "file",
+                "diffChecksum": "",
+            }),
+        )
+        .await
+        .expect("GetCheckoutFileDiffText");
+    let response: zeron_proto::CheckoutFileDiffText =
+        serde_json::from_value(response).expect("typed response");
+    assert_eq!(response.old_text.as_deref(), Some("one\ntwo\n"));
+    assert_eq!(response.new_text.as_deref(), Some("one\ntwo edited\n"));
+    assert_eq!(response.diff_checksum, "");
+    assert!(!response.stale);
+
+    core.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn checkout_file_diff_text_rpc_reads_from_the_published_working_snapshot() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let repo_dir = tmp.path().join("repo");
+    init_repo(&repo_dir).await;
+    std::fs::write(repo_dir.join("a.txt"), "one\ntwo edited\n").expect("dirty tree");
+
+    let core = assemble(&tmp.path().join("data"));
+    core.workspace
+        .create_space(
+            "space-diff",
+            &core.device_id,
+            &repo_dir.to_string_lossy(),
+            None,
+            true,
+        )
+        .expect("space row");
+    core.workspace
+        .create_chat("chat-diff", Some("space-diff"), None, None, None)
+        .expect("chat row");
+    core.diff_sync.reconcile_now().await;
+
+    let mut diffs_rx = core.diff_sync.watch_diffs();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    let diff = loop {
+        if let Some(diff) = diffs_rx.borrow().first().cloned() {
+            break diff;
+        }
+        tokio::time::timeout_at(deadline, diffs_rx.changed())
+            .await
+            .expect("published diff before timeout")
+            .expect("watch alive");
+    };
+    let identity = core
+        .repos
+        .checkout_identity(&repo_dir)
+        .await
+        .expect("checkout identity");
+    assert_eq!(identity.id, diff.checkout_id);
+
+    let client = zeron_rpc::memory_client(core.rpc_service());
+    let response = client
+        .call(
+            methods::GET_CHECKOUT_FILE_DIFF_TEXT,
+            serde_json::json!({
+                "checkoutId": identity.id,
+                "cwd": repo_dir,
+                "path": "a.txt",
+                "mode": "workingTree",
+                "diffChecksum": diff.checksum,
+            }),
+        )
+        .await
+        .expect("GetCheckoutFileDiffText");
+    let response: zeron_proto::CheckoutFileDiffText =
+        serde_json::from_value(response).expect("typed response");
+    assert_eq!(response.old_text.as_deref(), Some("one\ntwo\n"));
+    assert_eq!(response.new_text.as_deref(), Some("one\ntwo edited\n"));
+    assert!(!response.stale);
+
+    core.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn checkout_file_diff_text_rpc_reads_an_unchanged_tracked_file() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let repo_dir = tmp.path().join("repo");
+    init_repo(&repo_dir).await;
+
+    let core = assemble(&tmp.path().join("data"));
+    let identity = core
+        .repos
+        .checkout_identity(&repo_dir)
+        .await
+        .expect("checkout identity");
+    let snapshot = capture_diff(&core.repos, &repo_dir)
+        .await
+        .expect("clean diff snapshot");
+    assert!(
+        snapshot.files.is_empty(),
+        "fixture must have no changed files"
+    );
+    let client = zeron_rpc::memory_client(core.rpc_service());
+
+    let response = client
+        .call(
+            methods::GET_CHECKOUT_FILE_DIFF_TEXT,
+            serde_json::json!({
+                "checkoutId": identity.id,
+                "cwd": repo_dir,
+                "path": "a.txt",
+                "mode": "workingTree",
+                "diffChecksum": snapshot.checksum,
+            }),
+        )
+        .await
+        .expect("GetCheckoutFileDiffText");
+    let response: zeron_proto::CheckoutFileDiffText =
+        serde_json::from_value(response).expect("typed response");
+    assert_eq!(response.old_text.as_deref(), Some("one\ntwo\n"));
+    assert_eq!(response.new_text.as_deref(), Some("one\ntwo\n"));
+    assert!(!response.stale);
+
+    core.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn checkout_file_diff_text_rpc_reads_pinned_commit_sources() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let repo_dir = tmp.path().join("repo");

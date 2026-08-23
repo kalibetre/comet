@@ -966,6 +966,42 @@ fn decode_diff_source(
     Ok((Some(text), Some(hash), false))
 }
 
+fn diff_file_text_pair(
+    old: Option<Capture>,
+    new: Option<Capture>,
+    binary_hint: bool,
+) -> Result<DiffFileTextPair, EngineError> {
+    let truncated = old.as_ref().is_some_and(|source| source.truncated)
+        || new.as_ref().is_some_and(|source| source.truncated);
+    if truncated {
+        return Ok(DiffFileTextPair {
+            old_text: None,
+            new_text: None,
+            old_content_hash: None,
+            new_content_hash: None,
+            binary: false,
+            truncated: true,
+        });
+    }
+    let (old_text, old_content_hash, old_binary) = match old {
+        Some(source) => decode_diff_source(source.stdout)?,
+        None => (None, None, false),
+    };
+    let (new_text, new_content_hash, new_binary) = match new {
+        Some(source) => decode_diff_source(source.stdout)?,
+        None => (None, None, false),
+    };
+    let binary = old_binary || new_binary || binary_hint;
+    Ok(DiffFileTextPair {
+        old_text: (!binary).then_some(old_text).flatten(),
+        new_text: (!binary).then_some(new_text).flatten(),
+        old_content_hash: (!binary).then_some(old_content_hash).flatten(),
+        new_content_hash: (!binary).then_some(new_content_hash).flatten(),
+        binary,
+        truncated: false,
+    })
+}
+
 async fn read_worktree_source(root: &Path, path: &Path) -> Result<Capture, EngineError> {
     let canonical_root = tokio::fs::canonicalize(root)
         .await
@@ -1000,14 +1036,30 @@ async fn read_worktree_source(root: &Path, path: &Path) -> Result<Capture, Engin
     })
 }
 
+async fn read_optional_worktree_source(
+    root: &Path,
+    path: &Path,
+) -> Result<Option<Capture>, EngineError> {
+    let full = root.join(path);
+    match tokio::fs::symlink_metadata(&full).await {
+        Ok(_) => read_worktree_source(root, path).await.map(Some),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(EngineError::Other(format!(
+            "read diff file metadata: {error}"
+        ))),
+    }
+}
+
 async fn read_git_source(root: &Path, revision: &str, path: &Path) -> Result<Capture, EngineError> {
     let spec = format!("{revision}:{}", path.to_string_lossy());
     capture_git(root, &["cat-file", "blob", &spec], MAX_DIFF_SOURCE_BYTES).await
 }
 
 /// Read the exact old/new documents for one file in a previously captured diff.
-/// Paths must come from that snapshot's file summary; callers still recheck the
-/// snapshot checksum after this read to close the filesystem race.
+/// Paths are normally sourced from the snapshot's file summary. Callers may
+/// also pass a validated synthetic summary for an unchanged tracked file;
+/// they still recheck the snapshot checksum after this read to close the
+/// filesystem race.
 pub async fn read_diff_file_text(
     root: &Path,
     base: &str,
@@ -1040,35 +1092,21 @@ pub(crate) async fn read_diff_file_text_at(
     } else {
         Some(read_worktree_source(root, new_path).await?)
     };
-    let truncated = old.as_ref().is_some_and(|source| source.truncated)
-        || new.as_ref().is_some_and(|source| source.truncated);
-    if truncated {
-        return Ok(DiffFileTextPair {
-            old_text: None,
-            new_text: None,
-            old_content_hash: None,
-            new_content_hash: None,
-            binary: false,
-            truncated: true,
-        });
-    }
-    let (old_text, old_content_hash, old_binary) = match old {
-        Some(source) => decode_diff_source(source.stdout)?,
-        None => (None, None, false),
-    };
-    let (new_text, new_content_hash, new_binary) = match new {
-        Some(source) => decode_diff_source(source.stdout)?,
-        None => (None, None, false),
-    };
-    let binary = old_binary || new_binary || file.binary;
-    Ok(DiffFileTextPair {
-        old_text: (!binary).then_some(old_text).flatten(),
-        new_text: (!binary).then_some(new_text).flatten(),
-        old_content_hash: (!binary).then_some(old_content_hash).flatten(),
-        new_content_hash: (!binary).then_some(new_content_hash).flatten(),
-        binary,
-        truncated: false,
-    })
+    diff_file_text_pair(old, new, file.binary)
+}
+
+/// Read a file immediately from the checkout when the diff watcher has not
+/// published its first snapshot yet. The old side is best-effort so untracked
+/// files open as additions and deleted files open as deletions.
+pub(crate) async fn read_checkout_file_text(
+    root: &Path,
+    base: &str,
+    path: &str,
+) -> Result<DiffFileTextPair, EngineError> {
+    let path = validate_diff_path(path)?;
+    let old = read_git_source(root, base, path).await.ok();
+    let new = read_optional_worktree_source(root, path).await?;
+    diff_file_text_pair(old, new, false)
 }
 
 /// Resolve the parent used as a commit diff's old side. Root commits compare

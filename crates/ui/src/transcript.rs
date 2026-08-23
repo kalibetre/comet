@@ -507,67 +507,13 @@ pub fn call_block(call: &ToolCall) -> Option<ToolDetail> {
 /// [`crate::changes::FileDiff`]: hunks grouped with 3 context lines, dual
 /// 1-based line numbers, unified-diff hunk headers, and add/del counts.
 pub fn diff_to_file(diff: &zeron_proto::ToolDiff) -> crate::changes::FileDiff {
-    use crate::changes::{DiffLine, FileDiff, FileStatus, Hunk, LineKind};
-    let old = diff.old_text.as_deref().unwrap_or("");
-    let text_diff = similar::TextDiff::from_lines(old, &diff.new_text);
-    let mut hunks = Vec::new();
-    let (mut additions, mut deletions) = (0u32, 0u32);
-    let mut max_line = 0u32;
-    for group in text_diff.grouped_ops(3) {
-        let (Some(first), Some(last)) = (group.first(), group.last()) else {
-            continue;
-        };
-        let old_range = first.old_range().start..last.old_range().end;
-        let new_range = first.new_range().start..last.new_range().end;
-        let header = format!(
-            "@@ -{},{} +{},{} @@",
-            old_range.start + 1,
-            old_range.len(),
-            new_range.start + 1,
-            new_range.len(),
-        );
-        let mut lines = Vec::new();
-        for op in &group {
-            for change in text_diff.iter_changes(op) {
-                let kind = match change.tag() {
-                    similar::ChangeTag::Delete => {
-                        deletions += 1;
-                        LineKind::Del
-                    }
-                    similar::ChangeTag::Insert => {
-                        additions += 1;
-                        LineKind::Add
-                    }
-                    similar::ChangeTag::Equal => LineKind::Context,
-                };
-                let old_no = change.old_index().map(|n| n as u32 + 1);
-                let new_no = change.new_index().map(|n| n as u32 + 1);
-                max_line = max_line.max(old_no.unwrap_or(0)).max(new_no.unwrap_or(0));
-                lines.push(DiffLine {
-                    kind,
-                    old_no,
-                    new_no,
-                    text: change.value().trim_end_matches('\n').to_owned(),
-                });
-            }
-        }
-        hunks.push(Hunk { header, lines });
-    }
-    FileDiff {
-        path: diff.path.clone(),
-        old_path: None,
-        status: if diff.old_text.is_none() {
-            FileStatus::Added
-        } else {
-            FileStatus::Modified
-        },
-        binary: false,
-        notices: Vec::new(),
-        hunks,
-        additions,
-        deletions,
-        max_line,
-    }
+    crate::changes::file_diff_from_texts(
+        diff.path.clone(),
+        diff.old_text.as_deref(),
+        Some(&diff.new_text),
+        false,
+        false,
+    )
 }
 
 #[derive(Clone)]
@@ -1938,6 +1884,9 @@ pub enum TranscriptEvent {
         title: String,
         frozen: bool,
     },
+    /// A local Markdown file link was clicked. The shell resolves the path
+    /// against the selected checkout and opens the shared Changes viewer.
+    OpenFile { path: String, line: Option<u32> },
 }
 
 impl gpui::EventEmitter<TranscriptEvent> for Transcript {}
@@ -3861,6 +3810,7 @@ impl Transcript {
                     cache: (!render_cache_disabled()).then(|| self.render_cache.clone()),
                     now: Instant::now(),
                     copy: Some(self.copy_ui_for(&row.id, cx)),
+                    file_link: Some(self.file_link_handler(cx)),
                 };
                 let highlight = self.code_highlight_for(&row.id, tree, Some(*block_ix), cx);
                 let Some(top) = tree.blocks.get(*block_ix) else {
@@ -3903,6 +3853,7 @@ impl Transcript {
                     cache: (!render_cache_disabled()).then(|| self.render_cache.clone()),
                     now: Instant::now(),
                     copy: Some(self.copy_ui_for(&row.id, cx)),
+                    file_link: Some(self.file_link_handler(cx)),
                 };
                 let highlight = self.code_highlight_for(&row.id, tree, Some(*block_ix), cx);
                 let Some(top) = tree.blocks.get(*block_ix) else {
@@ -4127,6 +4078,23 @@ impl Transcript {
                     .ok();
             });
         render::CopyUi { handler, copied_ix }
+    }
+
+    /// Markdown owns link hit-testing; the shell owns surfaces. This adapter
+    /// keeps that seam small and lets every transcript (including subagent
+    /// tabs) route a workspace file through the same shell event.
+    fn file_link_handler(&self, cx: &mut Context<Self>) -> render::FileLinkHandler {
+        let entity = cx.weak_entity();
+        Rc::new(move |file, _window, cx| {
+            entity
+                .update(cx, |_, cx| {
+                    cx.emit(TranscriptEvent::OpenFile {
+                        path: file.path,
+                        line: file.line,
+                    });
+                })
+                .ok();
+        })
     }
 
     /// Request highlights for the code blocks of a tree. `only` limits to one

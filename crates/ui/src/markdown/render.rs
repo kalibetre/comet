@@ -61,6 +61,102 @@ pub fn table_hairline() -> Hsla {
     crate::theme::hairline(0.10)
 }
 
+/// A Markdown link that points at a workspace file. The path is kept in the
+/// link's own coordinate system (relative or absolute); the transcript
+/// resolves it against the selected checkout before opening a surface.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileLink {
+    pub path: String,
+    pub line: Option<u32>,
+}
+
+/// Semantic destination for an inline Markdown link. Keeping local files out
+/// of `cx.open_url` is important: GPUI's platform URL opener is for external
+/// handlers, while workspace files need the shell's checkout-aware viewer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LinkTarget {
+    External(String),
+    File(FileLink),
+}
+
+/// Shell-facing adapter for workspace-file links. Markdown stays reusable by
+/// callers that do not have a checkout viewer; those callers can leave this
+/// unset and local links fall back to the platform opener.
+pub type FileLinkHandler = Rc<dyn Fn(FileLink, &mut Window, &mut gpui::App)>;
+
+fn percent_decode_path(encoded: &str) -> Option<String> {
+    let mut bytes = Vec::with_capacity(encoded.len());
+    let raw = encoded.as_bytes();
+    let mut at = 0;
+    while at < raw.len() {
+        if raw[at] == b'%' {
+            let hex = std::str::from_utf8(raw.get(at + 1..at + 3)?).ok()?;
+            bytes.push(u8::from_str_radix(hex, 16).ok()?);
+            at += 3;
+        } else {
+            bytes.push(raw[at]);
+            at += 1;
+        }
+    }
+    String::from_utf8(bytes).ok()
+}
+
+fn line_anchor(fragment: &str) -> Option<u32> {
+    fragment
+        .strip_prefix('L')
+        .or_else(|| fragment.strip_prefix("line="))
+        .or_else(|| fragment.strip_prefix("line-"))
+        .and_then(|line| line.split(['-', 'C']).next())
+        .and_then(|line| line.parse().ok())
+}
+
+fn uri_scheme(value: &str) -> Option<&str> {
+    let (scheme, _) = value.split_once(':')?;
+    if scheme.is_empty()
+        || !scheme
+            .chars()
+            .next()
+            .is_some_and(|ch| ch.is_ascii_alphabetic())
+        || !scheme
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '+' | '-' | '.'))
+    {
+        return None;
+    }
+    Some(scheme)
+}
+
+/// Classify a parsed Markdown destination without touching the platform.
+/// Relative paths, `file:` URLs, and the composer's `zeron-file:` URLs become
+/// workspace targets; URI schemes such as `https:`, `mailto:`, or `vscode:`
+/// remain external.
+pub fn classify_link(url: &str) -> LinkTarget {
+    let (path_part, fragment) = url.split_once('#').unwrap_or((url, ""));
+    let line = line_anchor(fragment);
+    let file_path = if let Some(encoded) = path_part.strip_prefix("zeron-file:") {
+        percent_decode_path(encoded)
+    } else if let Some(encoded) = path_part.strip_prefix("file://") {
+        let encoded = encoded.strip_prefix("localhost/").unwrap_or(encoded);
+        let encoded = encoded.strip_prefix('/').unwrap_or(encoded);
+        percent_decode_path(&format!("/{encoded}"))
+    } else if let Some(encoded) = path_part.strip_prefix("file:") {
+        percent_decode_path(encoded)
+    } else if uri_scheme(path_part).is_none()
+        && !path_part.is_empty()
+        && !path_part.starts_with('#')
+        && !path_part.starts_with("//")
+    {
+        percent_decode_path(path_part)
+    } else {
+        None
+    };
+
+    match file_path {
+        Some(path) if !path.is_empty() => LinkTarget::File(FileLink { path, line }),
+        _ => LinkTarget::External(url.to_string()),
+    }
+}
+
 /// Options for one rendered tree (a transcript row or a whole live message).
 pub struct RenderOptions {
     /// Stable row key — prefixes element ids (scroll state, animations).
@@ -79,6 +175,8 @@ pub struct RenderOptions {
     /// Code-block copy-button plumbing (round 9): `None` renders no button
     /// (previews outside the transcript).
     pub copy: Option<CopyUi>,
+    /// Optional checkout-aware handler for local Markdown file links.
+    pub file_link: Option<FileLinkHandler>,
 }
 
 /// Copy-button wiring for one row's code blocks: the handler writes the code
@@ -99,6 +197,7 @@ impl RenderOptions {
             cache: None,
             now: Instant::now(),
             copy: None,
+            file_link: None,
         }
     }
 }
@@ -495,7 +594,7 @@ fn render_table(
 pub struct FlatText {
     pub text: SharedString,
     pub runs: Vec<TextRun>,
-    pub links: Vec<(Range<usize>, String)>,
+    pub links: Vec<(Range<usize>, LinkTarget)>,
     pub code_ranges: Vec<Range<usize>>,
 }
 
@@ -532,7 +631,7 @@ pub fn flatten_runs(runs: &[InlineRun], theme: &Theme, bold_default: bool) -> Fl
 fn flatten_runs_weighted(runs: &[InlineRun], theme: &Theme, base_weight: FontWeight) -> FlatText {
     let mut text = String::new();
     let mut out: Vec<TextRun> = Vec::with_capacity(runs.len());
-    let mut links: Vec<(Range<usize>, String)> = Vec::new();
+    let mut links: Vec<(Range<usize>, LinkTarget)> = Vec::new();
     let mut code_ranges: Vec<Range<usize>> = Vec::new();
     for run in runs {
         if run.text.is_empty() {
@@ -578,12 +677,13 @@ fn flatten_runs_weighted(runs: &[InlineRun], theme: &Theme, base_weight: FontWei
             // so the URL's completion changes nothing visually — but is not
             // clickable until the real destination exists.
             if url != super::mend::PENDING_LINK_URL {
+                let target = classify_link(url);
                 // Merge adjacent runs of the same link into one clickable range.
                 match links.last_mut() {
-                    Some((range, last_url)) if range.end == start && last_url == url => {
+                    Some((range, last_target)) if range.end == start && last_target == &target => {
                         range.end = text.len();
                     }
-                    _ => links.push((start..text.len(), url.clone())),
+                    _ => links.push((start..text.len(), target)),
                 }
             }
         }
@@ -661,12 +761,26 @@ fn flat_text_element(
     let text_el: AnyElement = if flat.links.is_empty() {
         styled.into_any_element()
     } else {
-        let (ranges, urls): (Vec<_>, Vec<_>) = flat.links.iter().cloned().unzip();
+        let (ranges, targets): (Vec<_>, Vec<_>) = flat.links.iter().cloned().unzip();
+        let file_link = opts.file_link.clone();
         let id: SharedString = format!("{}-t{ix}", opts.row_key).into();
         InteractiveText::new(id, styled)
             .on_click(ranges, move |clicked_ix, _window, cx| {
-                if let Some(url) = urls.get(clicked_ix) {
-                    cx.open_url(url);
+                if let Some(target) = targets.get(clicked_ix) {
+                    match target {
+                        LinkTarget::External(url) => cx.open_url(url),
+                        LinkTarget::File(file) => {
+                            if let Some(handler) = &file_link {
+                                handler(file.clone(), _window, cx);
+                            } else {
+                                let url = match file.line {
+                                    Some(line) => format!("{}#L{line}", file.path),
+                                    None => file.path.clone(),
+                                };
+                                cx.open_url(&url);
+                            }
+                        }
+                    }
                 }
             })
             .into_any_element()
@@ -1455,13 +1569,45 @@ mod tests {
         ];
         let flat = flatten_runs(&runs, &theme, false);
         assert_eq!(flat.text, "go here now");
-        assert_eq!(flat.links, vec![(3..7, "https://x.dev".to_string())]);
+        assert_eq!(
+            flat.links,
+            vec![(3..7, LinkTarget::External("https://x.dev".to_string()))]
+        );
         let total: usize = flat.runs.iter().map(|r| r.len).sum();
         assert_eq!(total, flat.text.len());
         // Links stay monochrome (foreground + underline), never accent-tinted.
         assert_eq!(flat.runs[1].color, theme.text);
         assert!(flat.runs[1].underline.is_some());
         assert_eq!(flat.runs[2].font.weight, FontWeight::SEMIBOLD);
+    }
+
+    #[test]
+    fn local_file_links_are_workspace_targets_with_line_anchors() {
+        assert_eq!(
+            classify_link("src/main.rs#L42"),
+            LinkTarget::File(FileLink {
+                path: "src/main.rs".into(),
+                line: Some(42),
+            })
+        );
+        assert_eq!(
+            classify_link("file:///workspace/src/main.rs#L7"),
+            LinkTarget::File(FileLink {
+                path: "/workspace/src/main.rs".into(),
+                line: Some(7),
+            })
+        );
+        assert_eq!(
+            classify_link("src/main.rs#L42-L45"),
+            LinkTarget::File(FileLink {
+                path: "src/main.rs".into(),
+                line: Some(42),
+            })
+        );
+        assert_eq!(
+            classify_link("https://example.com/src/main.rs#L7"),
+            LinkTarget::External("https://example.com/src/main.rs#L7".into())
+        );
     }
 
     #[test]
@@ -1525,6 +1671,9 @@ mod tests {
             },
         ];
         let flat = flatten_runs(&runs, &theme, false);
-        assert_eq!(flat.links, vec![(0..9, "https://x.dev".to_string())]);
+        assert_eq!(
+            flat.links,
+            vec![(0..9, LinkTarget::External("https://x.dev".to_string()))]
+        );
     }
 }

@@ -75,6 +75,31 @@ use crate::workspace_host::WorkspaceHost;
 const FILE_SEARCH_RPC_TIMEOUT: Duration = Duration::from_secs(6);
 const FILE_SEARCH_FEATURED_PATHS: usize = 32;
 
+async fn read_direct_checkout_file(
+    root: &std::path::Path,
+    path: String,
+    diff_checksum: String,
+) -> Result<RpcReply, RpcError> {
+    let base = Box::pin(crate::diff_sync::working_diff_base(root))
+        .await
+        .map_err(|error| RpcError::Failed(error.to_string()))?;
+    let pair = Box::pin(crate::diff_sync::read_checkout_file_text(
+        root, &base, &path,
+    ))
+    .await
+    .map_err(|error| RpcError::Failed(error.to_string()))?;
+    RpcReply::value(&zeron_proto::CheckoutFileDiffText {
+        diff_checksum,
+        old_text: pair.old_text,
+        new_text: pair.new_text,
+        old_content_hash: pair.old_content_hash,
+        new_content_hash: pair.new_content_hash,
+        binary: pair.binary,
+        truncated: pair.truncated,
+        stale: false,
+    })
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ChatParams {
@@ -1524,10 +1549,84 @@ impl RpcService for EngineRpc {
                         Box::pin(self.repos.checkout_identity(std::path::Path::new(&p.cwd)))
                             .await
                             .map_err(|error| RpcError::Failed(error.to_string()))?;
-                    if identity.id != p.checkout_id {
+                    let direct_file = p.mode == "file" && p.checkout_id.is_empty();
+                    if identity.id != p.checkout_id && !direct_file {
                         return Err(RpcError::Failed("checkoutId does not match cwd".into()));
                     }
                     let root = identity.root.as_path();
+
+                    // The first file click can race the initial diff-watch
+                    // reconciliation. Read the requested source pair directly
+                    // so the viewer can render immediately; the watch-backed
+                    // request below replaces it once the canonical snapshot
+                    // is available. Keep this in a separately boxed helper so
+                    // the normal working-diff RPC stays within the worker stack
+                    // budget.
+                    if p.mode == "file" {
+                        return Box::pin(read_direct_checkout_file(
+                            root,
+                            p.path.clone(),
+                            p.diff_checksum.clone(),
+                        ))
+                        .await;
+                    }
+
+                    // A transcript file link normally carries the checksum from the
+                    // already-published working-tree snapshot. Reuse that snapshot's
+                    // file summary and read the two source documents directly instead
+                    // of recapturing the entire checkout before and after the read.
+                    // The watch stream remains the freshness boundary: if the checkout
+                    // changes while this is in flight, the UI receives the newer
+                    // checksum and discards this older file response.
+                    let cached_working_snapshot =
+                        if matches!(p.mode.as_str(), "working" | "workingTree") {
+                            let diffs = self.diff_sync.watch_diffs();
+                            diffs
+                                .borrow()
+                                .iter()
+                                .find(|diff| {
+                                    diff.checkout_id == p.checkout_id
+                                        && diff.checksum == p.diff_checksum
+                                        && diff.cwd == identity.root.to_string_lossy()
+                                })
+                                .cloned()
+                        } else {
+                            None
+                        };
+                    if let Some(snapshot) = cached_working_snapshot {
+                        let base = Box::pin(crate::diff_sync::working_diff_base(root))
+                            .await
+                            .map_err(|error| RpcError::Failed(error.to_string()))?;
+                        let file = snapshot
+                            .files
+                            .iter()
+                            .find(|file| file.path == p.path)
+                            .cloned()
+                            .unwrap_or_else(|| zeron_proto::DiffFileSummary {
+                                path: p.path.clone(),
+                                old_path: None,
+                                status: "modified".into(),
+                                additions: 0,
+                                deletions: 0,
+                                binary: false,
+                            });
+                        let pair = Box::pin(crate::diff_sync::read_diff_file_text_at(
+                            root, &base, None, &file,
+                        ))
+                        .await
+                        .map_err(|error| RpcError::Failed(error.to_string()))?;
+                        return RpcReply::value(&zeron_proto::CheckoutFileDiffText {
+                            diff_checksum: p.diff_checksum,
+                            old_text: pair.old_text,
+                            new_text: pair.new_text,
+                            old_content_hash: pair.old_content_hash,
+                            new_content_hash: pair.new_content_hash,
+                            binary: pair.binary,
+                            truncated: pair.truncated,
+                            stale: false,
+                        });
+                    }
+
                     let (snapshot, base, target) = match p.mode.as_str() {
                         "branch" => {
                             let base_ref = p
@@ -1609,14 +1708,20 @@ impl RpcService for EngineRpc {
                         .files
                         .iter()
                         .find(|file| file.path == p.path)
-                        .ok_or_else(|| {
-                            RpcError::Failed("path is not part of diff snapshot".into())
-                        })?;
+                        .cloned()
+                        .unwrap_or_else(|| zeron_proto::DiffFileSummary {
+                            path: p.path.clone(),
+                            old_path: None,
+                            status: "modified".into(),
+                            additions: 0,
+                            deletions: 0,
+                            binary: false,
+                        });
                     let pair = Box::pin(crate::diff_sync::read_diff_file_text_at(
                         root,
                         &base,
                         target.as_deref(),
-                        file,
+                        &file,
                     ))
                     .await
                     .map_err(|error| RpcError::Failed(error.to_string()))?;

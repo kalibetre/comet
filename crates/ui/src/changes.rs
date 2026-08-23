@@ -31,6 +31,7 @@
 
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
+use std::path::{Component, Path};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -438,6 +439,157 @@ pub fn parse_patch(patch: &str) -> Vec<FileDiff> {
     files
 }
 
+/// Build the Changes pane's normal [`FileDiff`] model from a pair of complete
+/// source documents. A clean file is represented as one context hunk, which
+/// lets the existing virtualized rows, syntax highlighter, and review-comment
+/// anchors serve unchanged files too.
+pub fn file_diff_from_texts(
+    path: String,
+    old_text: Option<&str>,
+    new_text: Option<&str>,
+    binary: bool,
+    truncated: bool,
+) -> FileDiff {
+    let mut file = FileDiff::new(path, None);
+    file.status = match (old_text, new_text) {
+        (None, Some(_)) => FileStatus::Added,
+        (Some(_), None) => FileStatus::Deleted,
+        _ => FileStatus::Modified,
+    };
+    file.binary = binary;
+    if truncated {
+        file.notices
+            .push("File is too large to display".to_string());
+    }
+    if binary || truncated {
+        return file;
+    }
+
+    let old = old_text.unwrap_or("");
+    let new = new_text.unwrap_or("");
+    let text_diff = similar::TextDiff::from_lines(old, new);
+    let mut hunks = Vec::new();
+    let (mut additions, mut deletions) = (0u32, 0u32);
+    let mut max_line = 0u32;
+    for group in text_diff.grouped_ops(3) {
+        let (Some(first), Some(last)) = (group.first(), group.last()) else {
+            continue;
+        };
+        let old_range = first.old_range().start..last.old_range().end;
+        let new_range = first.new_range().start..last.new_range().end;
+        let header = format!(
+            "@@ -{},{} +{},{} @@",
+            old_range.start + 1,
+            old_range.len(),
+            new_range.start + 1,
+            new_range.len(),
+        );
+        let mut lines = Vec::new();
+        for op in &group {
+            for change in text_diff.iter_changes(op) {
+                let kind = match change.tag() {
+                    similar::ChangeTag::Delete => {
+                        deletions += 1;
+                        LineKind::Del
+                    }
+                    similar::ChangeTag::Insert => {
+                        additions += 1;
+                        LineKind::Add
+                    }
+                    similar::ChangeTag::Equal => LineKind::Context,
+                };
+                let old_no = change.old_index().map(|n| n as u32 + 1);
+                let new_no = change.new_index().map(|n| n as u32 + 1);
+                max_line = max_line.max(old_no.unwrap_or(0)).max(new_no.unwrap_or(0));
+                lines.push(DiffLine {
+                    kind,
+                    old_no,
+                    new_no,
+                    text: change.value().trim_end_matches('\n').to_owned(),
+                });
+            }
+        }
+        hunks.push(Hunk { header, lines });
+    }
+
+    // `similar` quite reasonably emits no changed groups for an identical
+    // document. The file viewer still needs a body in that case so a clean
+    // file can be read and cited.
+    if hunks.is_empty() {
+        if new.is_empty() {
+            file.notices.push("Empty file".to_string());
+        } else if old == new {
+            let lines: Vec<DiffLine> = new
+                .lines()
+                .enumerate()
+                .map(|(ix, text)| DiffLine {
+                    kind: LineKind::Context,
+                    old_no: Some(ix as u32 + 1),
+                    new_no: Some(ix as u32 + 1),
+                    text: text.to_string(),
+                })
+                .collect();
+            max_line = lines.len() as u32;
+            hunks.push(Hunk {
+                header: format!("@@ -1,{} +1,{} @@", lines.len(), lines.len()),
+                lines,
+            });
+        }
+    }
+    file.hunks = hunks;
+    file.additions = additions;
+    file.deletions = deletions;
+    file.max_line = max_line;
+    file
+}
+
+/// Convert the engine's checkout-aware source response into the same model as
+/// a Git patch. Stale responses are discarded by the caller so a link click
+/// never opens a file from the wrong revision.
+pub fn file_diff_from_sources(
+    path: String,
+    response: &zeron_proto::CheckoutFileDiffText,
+) -> Result<FileDiff, String> {
+    if response.stale {
+        return Err("File changed while opening — retry the link".to_string());
+    }
+    Ok(file_diff_from_texts(
+        path,
+        response.old_text.as_deref(),
+        response.new_text.as_deref(),
+        response.binary,
+        response.truncated,
+    ))
+}
+
+/// Resolve a Markdown file destination against a checkout without touching
+/// the filesystem. Absolute destinations must stay inside `cwd`; relative
+/// destinations are normalized to the slash-separated paths accepted by the
+/// engine's diff RPC.
+pub fn normalize_workspace_path(cwd: &str, raw: &str) -> Option<String> {
+    let raw_path = Path::new(raw);
+    let relative = if raw_path.is_absolute() {
+        raw_path.strip_prefix(Path::new(cwd)).ok()?
+    } else {
+        raw_path
+    };
+    let mut parts = Vec::new();
+    for component in relative.components() {
+        let Component::Normal(part) = component else {
+            if matches!(component, Component::CurDir) {
+                continue;
+            }
+            return None;
+        };
+        let part = part.to_str()?;
+        if part.is_empty() || part.contains('\\') || part.chars().any(char::is_control) {
+            return None;
+        }
+        parts.push(part);
+    }
+    (!parts.is_empty()).then(|| parts.join("/"))
+}
+
 /// Derived per-file notice rows (new/deleted/renamed/binary + parser notices).
 pub fn file_notices(file: &FileDiff) -> Vec<String> {
     let mut notices = Vec::new();
@@ -726,6 +878,10 @@ pub enum DiffScope {
     LatestTurn,
     /// Repository commit graph. Hosted here until the right pane becomes tabs.
     History,
+    /// One complete workspace file opened from a transcript link. It uses the
+    /// same rows and controls as a diff, with the old/new pair synthesized
+    /// from the checkout-aware source RPC.
+    File,
     /// One commit's own changes (parent vs commit) — the per-commit tab a
     /// History row click opens. Never listed in the scope menu
     /// ([`Self::ALL`]); a commit-pinned pane is born this way and stays.
@@ -746,6 +902,7 @@ impl DiffScope {
             Self::Branch => "Branch changes",
             Self::LatestTurn => "Latest turn",
             Self::History => "History",
+            Self::File => "File",
             Self::Commit => "Commit",
         }
     }
@@ -757,6 +914,7 @@ impl DiffScope {
             Self::Branch => "branch",
             Self::LatestTurn => "turn",
             Self::History => "history",
+            Self::File => "workingTree",
             Self::Commit => "commit",
         }
     }
@@ -773,6 +931,7 @@ pub fn scope_label(scope: DiffScope, count: usize, base: Option<&str>) -> String
         },
         DiffScope::LatestTurn => format!("{count} Changed {files} this turn"),
         DiffScope::History => "History".to_string(),
+        DiffScope::File => "File".to_string(),
         DiffScope::Commit => format!("{count} Changed {files} in this commit"),
     }
 }
@@ -808,6 +967,7 @@ pub fn clean_message(scope: DiffScope, base: Option<&str>) -> String {
         },
         DiffScope::LatestTurn => "No changes this turn".to_string(),
         DiffScope::History => "No commits found".to_string(),
+        DiffScope::File => "File unavailable".to_string(),
         DiffScope::Commit => "Empty commit".to_string(),
     }
 }
@@ -1212,6 +1372,31 @@ pub fn flatten_rows(
     (rows, ranges)
 }
 
+fn row_reveals_line(row: &DiffRow, files: &[FileDiff], file_ix: usize, target: u32) -> bool {
+    let line_matches = |hunk_ix: u32, line_ix: u32| {
+        files
+            .get(file_ix)
+            .and_then(|file| file.hunks.get(hunk_ix as usize))
+            .and_then(|hunk| hunk.lines.get(line_ix as usize))
+            .is_some_and(|line| line.new_no == Some(target))
+    };
+    match row {
+        DiffRow::Line {
+            file, hunk, line, ..
+        } if *file as usize == file_ix => line_matches(*hunk, *line),
+        DiffRow::SplitLine {
+            file,
+            hunk,
+            left,
+            right,
+        } if *file as usize == file_ix => left
+            .into_iter()
+            .chain(right)
+            .any(|line| line_matches(*hunk, *line)),
+        _ => false,
+    }
+}
+
 #[derive(Default, Clone, Copy)]
 struct FileFold {
     collapsed: bool,
@@ -1298,6 +1483,12 @@ struct CommentDraft {
     _events: Subscription,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FileRequest {
+    path: String,
+    line: Option<u32>,
+}
+
 /// The Changes pane entity. Lazy: no RPC until [`Changes::ensure_watch`] runs
 /// (the shell calls it when the pane first opens).
 pub struct Changes {
@@ -1313,6 +1504,15 @@ pub struct Changes {
     watch_task: Option<Task<()>>,
     parsed: Option<ParsedDiff>,
     parse_task: Option<Task<()>>,
+    /// A transcript link turns the Changes pane into a one-file viewer. The
+    /// request is kept separate from `DiffScope` so the regular watch/parser
+    /// state remains reusable and the tab can be keyed by the source pair.
+    file_request: Option<FileRequest>,
+    file_task: Option<Task<()>>,
+    file_inflight: Option<String>,
+    file_attempted: Option<String>,
+    file_error: Option<SharedString>,
+    pending_reveal: Option<(String, Option<u32>)>,
     folds: HashMap<String, FileFold>,
     highlights: HashMap<String, HighlightSlot>,
     /// The flattened row model the list virtualizes over (line granularity;
@@ -1385,6 +1585,12 @@ impl Changes {
             watch_task: None,
             parsed: None,
             parse_task: None,
+            file_request: None,
+            file_task: None,
+            file_inflight: None,
+            file_attempted: None,
+            file_error: None,
+            pending_reveal: None,
             folds: HashMap::new(),
             highlights: HashMap::new(),
             rows: Vec::new(),
@@ -1430,6 +1636,33 @@ impl Changes {
         changes
     }
 
+    /// A pane opened from a transcript file link. When the host already has a
+    /// resolved diff, seed it immediately so the file RPC does not wait for a
+    /// second checkout-watch subscription to deliver the same snapshot.
+    pub fn for_file(
+        state: Entity<AppState>,
+        path: String,
+        line: Option<u32>,
+        initial_diff: Option<CheckoutDiff>,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let mut changes = Self::new(state, cx);
+        if let Some(diff) = initial_diff {
+            changes.diffs.push(diff);
+        }
+        changes.scope = DiffScope::File;
+        changes.pending_reveal = Some((path.clone(), line));
+        changes.file_request = Some(FileRequest { path, line });
+        changes
+    }
+
+    /// Snapshot already held by the active diff surface, if it has resolved
+    /// the selected chat's checkout. File links use this to avoid waiting for
+    /// a duplicate watch subscription before starting their source read.
+    pub fn checkout_snapshot(&self, cx: &App) -> Option<CheckoutDiff> {
+        self.resolved(cx)
+    }
+
     /// The surface-tab title (contextual, user request): the pinned commit's
     /// subject (short sha for subject-less commits), else the scope's label.
     pub fn tab_title(&self) -> gpui::SharedString {
@@ -1439,6 +1672,9 @@ impl Changes {
                 return subject.to_string().into();
             }
             return commit.sha.chars().take(7).collect::<String>().into();
+        }
+        if let Some(file) = &self.file_request {
+            return file.path.clone().into();
         }
         gpui::SharedString::from(self.scope.label())
     }
@@ -1562,7 +1798,7 @@ impl Changes {
         match self.scope {
             DiffScope::WorkingTree => self.resolved(cx),
             DiffScope::Branch | DiffScope::LatestTurn | DiffScope::Commit => self.scoped.clone(),
-            DiffScope::History => None,
+            DiffScope::History | DiffScope::File => None,
         }
     }
 
@@ -1574,6 +1810,13 @@ impl Changes {
             DiffScope::Branch => format!("br:{}", self.base_ref.as_deref().unwrap_or("")),
             DiffScope::LatestTurn => "turn".to_string(),
             DiffScope::History => "history".to_string(),
+            DiffScope::File => format!(
+                "file:{}",
+                self.file_request
+                    .as_ref()
+                    .map(|file| file.path.as_str())
+                    .unwrap_or("")
+            ),
             DiffScope::Commit => format!(
                 "commit:{}",
                 self.commit.as_ref().map(|c| c.sha.as_str()).unwrap_or("")
@@ -1594,6 +1837,12 @@ impl Changes {
     /// device+cwd); the repo's default branch (first entry) becomes the
     /// comparison base unless the user already picked one that still exists.
     fn ensure_branches(&mut self, cx: &mut Context<Self>) {
+        if matches!(
+            self.scope,
+            DiffScope::WorkingTree | DiffScope::History | DiffScope::File
+        ) {
+            return;
+        }
         let Some(cwd) = self.scoped_cwd(cx) else {
             return;
         };
@@ -1658,7 +1907,10 @@ impl Changes {
     /// checksum-only refresh keeps the old diff visible until the new one
     /// lands.
     fn ensure_scoped(&mut self, cx: &mut Context<Self>) {
-        if matches!(self.scope, DiffScope::WorkingTree | DiffScope::History) {
+        if matches!(
+            self.scope,
+            DiffScope::WorkingTree | DiffScope::History | DiffScope::File
+        ) {
             self.scoped_inflight = None;
             self.scoped_task = None;
             return;
@@ -1837,6 +2089,209 @@ impl Changes {
         cx.notify();
     }
 
+    fn clear_parsed(&mut self) {
+        self.parsed = None;
+        self.rows.clear();
+        self.row_ranges.clear();
+        self.list.reset(0);
+        self.folds.clear();
+        self.highlights.clear();
+        self.comment_key = 0;
+    }
+
+    /// Load one complete file through the same checkout snapshot used by the
+    /// diff pane when available. During the initial watch warm-up, issue a
+    /// direct source read so the first click does not wait for the repository
+    /// snapshot; the snapshot-backed request supersedes it when ready.
+    fn ensure_file(&mut self, cx: &mut Context<Self>) {
+        let Some(request) = self.file_request.clone() else {
+            return;
+        };
+        let (checkout_id, cwd, diff_checksum, mode, path, key) =
+            if let Some(diff) = self.resolved(cx) {
+                let Some(path) = normalize_workspace_path(&diff.cwd, &request.path) else {
+                    self.file_inflight = None;
+                    self.file_error = Some("This file is outside the selected checkout".into());
+                    self.clear_parsed();
+                    return;
+                };
+                let key = format!("{}:{}:{}", diff.checkout_id, diff.checksum, path);
+                (
+                    diff.checkout_id,
+                    diff.cwd,
+                    diff.checksum,
+                    "workingTree".to_string(),
+                    path,
+                    key,
+                )
+            } else {
+                let Some(chat) = self.state.read(cx).selected_chat_row() else {
+                    return;
+                };
+                let Some(cwd) = chat.cwd.clone() else {
+                    return;
+                };
+                let Some(path) = normalize_workspace_path(&cwd, &request.path) else {
+                    self.file_inflight = None;
+                    self.file_error = Some("This file is outside the selected checkout".into());
+                    self.clear_parsed();
+                    return;
+                };
+                let key = format!("direct:{cwd}:{path}");
+                (
+                    String::new(),
+                    cwd,
+                    String::new(),
+                    "file".to_string(),
+                    path,
+                    key,
+                )
+            };
+        if self.parsed.as_ref().is_some_and(|parsed| parsed.key == key) {
+            return;
+        }
+        if self.file_attempted.as_deref() == Some(key.as_str()) {
+            return;
+        }
+        if self.file_inflight.as_deref() == Some(key.as_str()) {
+            return;
+        }
+        let Some(engine) = self.state.read(cx).engine().cloned() else {
+            return;
+        };
+
+        self.pending_reveal = Some((path.clone(), request.line));
+        self.file_attempted = Some(key.clone());
+        self.file_inflight = Some(key.clone());
+        self.file_error = None;
+        self.clear_parsed();
+        let target = self.desired_target(cx);
+        let request = zeron_proto::GetCheckoutFileDiffTextRequest {
+            checkout_id,
+            cwd,
+            path: path.clone(),
+            mode,
+            base_ref: None,
+            chat_id: None,
+            commit_sha: None,
+            diff_checksum,
+        };
+        self.file_task = Some(cx.spawn(async move |this, cx| {
+            let mut params = serde_json::to_value(request)
+                .ok()
+                .and_then(|value| value.as_object().cloned())
+                .unwrap_or_default();
+            if let Some(target) = target {
+                params.insert("targetDeviceId".into(), serde_json::Value::String(target));
+            }
+            let loaded = match engine
+                .client()
+                .call(
+                    methods::GET_CHECKOUT_FILE_DIFF_TEXT,
+                    serde_json::Value::Object(params),
+                )
+                .await
+            {
+                Ok(value) => {
+                    match serde_json::from_value::<zeron_proto::CheckoutFileDiffText>(value) {
+                        Ok(response) => {
+                            cx.background_executor()
+                                .spawn(async move { file_diff_from_sources(path, &response) })
+                                .await
+                        }
+                        Err(error) => Err(format!("invalid file response: {error}")),
+                    }
+                }
+                Err(error) => Err(error.to_string()),
+            };
+            this.update(cx, |changes, cx| {
+                if changes.file_inflight.as_deref() != Some(key.as_str()) {
+                    return;
+                }
+                changes.file_inflight = None;
+                match loaded {
+                    Ok(file) => {
+                        let truncated = file
+                            .notices
+                            .iter()
+                            .any(|notice| notice == "File is too large to display");
+                        changes.install_file(key, file, truncated, cx);
+                    }
+                    Err(error) => {
+                        changes.clear_parsed();
+                        changes.file_error = Some(error.into());
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        }));
+    }
+
+    fn install_file(
+        &mut self,
+        key: String,
+        file: FileDiff,
+        truncated: bool,
+        cx: &mut Context<Self>,
+    ) {
+        self.folds.clear();
+        self.highlights.clear();
+        let staged = self.staged_comments(cx);
+        let draft = self.draft_anchor();
+        let files = Arc::new(vec![file]);
+        let (rows, ranges) = flatten_rows(
+            &files,
+            &staged,
+            draft
+                .as_ref()
+                .map(|(path, side, line)| (path.as_str(), *side, *line)),
+            self.mode,
+            |_| false,
+        );
+        let file = &files[0];
+        self.comment_key = comment_state_key(&staged, draft.as_ref());
+        self.list
+            .reset_with_uniform_height(rows.len(), px(DIFF_LINE_HEIGHT));
+        self.rows = rows;
+        self.row_ranges = ranges;
+        self.parsed = Some(ParsedDiff {
+            key,
+            truncated,
+            additions: file.additions,
+            deletions: file.deletions,
+            file_count: 1,
+            files,
+        });
+        self.file_error = None;
+        self.apply_pending_reveal();
+    }
+
+    fn apply_pending_reveal(&mut self) {
+        let Some((path, line)) = self.pending_reveal.take() else {
+            return;
+        };
+        let Some(parsed) = &self.parsed else {
+            return;
+        };
+        let files = parsed.files.clone();
+        let Some(file_ix) = files.iter().position(|file| file.path == path) else {
+            return;
+        };
+        let Some(range) = self.row_ranges.get(file_ix) else {
+            return;
+        };
+        let target = line
+            .and_then(|line| {
+                self.rows[range.clone()]
+                    .iter()
+                    .position(|row| row_reveals_line(row, &files, file_ix, line))
+                    .map(|offset| range.start + offset)
+            })
+            .unwrap_or(range.start);
+        self.list.scroll_to_reveal_item(target);
+    }
+
     /// Everything the pane needs kicked when (re)shown: the watch plus the
     /// scope-specific loads (branches, scoped/commit capture, history) — the
     /// shell's hook for freshly-mounted surface tabs.
@@ -1855,17 +2310,17 @@ impl Changes {
                 .update(cx, |history, cx| history.ensure_loaded(cx));
             return;
         }
+        if self.scope == DiffScope::File {
+            self.ensure_file(cx);
+            return;
+        }
         if self.scope != DiffScope::Commit {
             self.ensure_branches(cx);
         }
         self.ensure_scoped(cx);
         let Some(diff) = self.active_diff(cx) else {
             if self.parsed.take().is_some() {
-                self.rows.clear();
-                self.row_ranges.clear();
-                self.list.reset(0);
-                self.folds.clear();
-                self.highlights.clear();
+                self.clear_parsed();
                 cx.notify();
             }
             return;
@@ -3056,6 +3511,33 @@ impl Changes {
     /// alongside, shell-owned (they mutate shell state).
     pub fn render_header_controls(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let theme = Theme::of(cx).clone();
+        if let Some(file) = self.file_request.clone() {
+            return div()
+                .size_full()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(8.0))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .truncate()
+                        .font_family(theme.font_mono.clone())
+                        .text_size(px(11.5))
+                        .text_color(theme.text_muted)
+                        .child(SharedString::from(file.path)),
+                )
+                .child(self.split_toggle(&theme, cx))
+                .child(
+                    Self::header_button("changes-fold-all", crate::icons::FOLD_VERTICAL, &theme)
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            cx.stop_propagation();
+                            this.toggle_collapse_all(cx);
+                        })),
+                )
+                .into_any_element();
+        }
         // Commit-pinned pane: the pin never changes, so a fixed identity
         // chip (mono short sha + subject) replaces the scope dropdown;
         // fold-all still trails.
@@ -3445,6 +3927,13 @@ impl Changes {
 
     fn render_header_strip(&self, theme: &Theme) -> Option<AnyElement> {
         let parsed = self.parsed.as_ref()?;
+        let label = self
+            .file_request
+            .as_ref()
+            .map(|file| file.path.clone())
+            .unwrap_or_else(|| {
+                scope_label(self.scope, parsed.file_count, self.base_ref.as_deref())
+            });
         Some(
             div()
                 .flex_none()
@@ -3462,11 +3951,7 @@ impl Changes {
                         .truncate()
                         .text_size(px(12.0))
                         .text_color(theme.text_muted)
-                        .child(SharedString::from(scope_label(
-                            self.scope,
-                            parsed.file_count,
-                            self.base_ref.as_deref(),
-                        ))),
+                        .child(SharedString::from(label)),
                 )
                 .child(
                     div()
@@ -4235,16 +4720,24 @@ impl Render for Changes {
         let theme = Theme::of(cx).clone();
         let active = self.active_diff(cx);
         let scope = self.scope;
+        let file_mode = self.file_request.is_some();
         let base = self.base_ref.clone();
         // With no session selected (new-chat canvas) there is nothing to
         // prepare — show the quiet empty state, not an endless spinner.
         let no_chat = self.state.read(cx).selected_chat_row().is_none();
         let phase = if no_chat {
             DiffPhase::Clean
+        } else if file_mode {
+            if self.parsed.is_some() {
+                DiffPhase::List
+            } else {
+                DiffPhase::Preparing
+            }
         } else {
             diff_phase(active.as_ref())
         };
         let error = self.error.clone();
+        let file_notice = file_mode.then(|| self.file_error.clone()).flatten();
         // Scoped fetch failures replace the content area. "no turn recorded"
         // is the expected pre-first-turn state, not an error; "unknown
         // method" is version skew — the chat's host engine predates
@@ -4273,7 +4766,18 @@ impl Render for Changes {
                 }
             });
 
-        let content: AnyElement = if let Some((message, warn)) = scoped_notice {
+        let content: AnyElement = if let Some(message) = file_notice {
+            div()
+                .flex_1()
+                .flex()
+                .items_center()
+                .justify_center()
+                .px(px(Theme::SPACE_LG))
+                .text_size(px(12.0))
+                .text_color(theme.warning.opacity(0.85))
+                .child(message)
+                .into_any_element()
+        } else if let Some((message, warn)) = scoped_notice {
             div()
                 .flex_1()
                 .flex()
@@ -4949,6 +5453,42 @@ rename to new_name.rs
             binary: false,
         });
         assert_eq!(diff_phase(Some(&summarized)), DiffPhase::List);
+    }
+
+    #[test]
+    fn complete_file_sources_reuse_diff_rows_for_a_clean_file() {
+        let file = file_diff_from_texts(
+            "src/main.rs".into(),
+            Some("fn main() {}\n"),
+            Some("fn main() {}\n"),
+            false,
+            false,
+        );
+        assert_eq!(file.status, FileStatus::Modified);
+        assert_eq!(file.additions, 0);
+        assert_eq!(file.deletions, 0);
+        assert_eq!(file.hunks.len(), 1);
+        assert!(
+            file.hunks[0]
+                .lines
+                .iter()
+                .all(|line| line.kind == LineKind::Context)
+        );
+        assert_eq!(file.hunks[0].lines[0].new_no, Some(1));
+    }
+
+    #[test]
+    fn workspace_paths_are_relative_and_cannot_escape_checkout() {
+        assert_eq!(
+            normalize_workspace_path("/repo", "src/main.rs"),
+            Some("src/main.rs".into())
+        );
+        assert_eq!(
+            normalize_workspace_path("/repo", "/repo/src/main.rs"),
+            Some("src/main.rs".into())
+        );
+        assert_eq!(normalize_workspace_path("/repo", "/other/main.rs"), None);
+        assert_eq!(normalize_workspace_path("/repo", "../main.rs"), None);
     }
 
     #[test]

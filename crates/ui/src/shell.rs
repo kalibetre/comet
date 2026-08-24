@@ -4210,10 +4210,9 @@ impl Shell {
         let filter_row = self.render_spaces_filter(theme, cx);
 
         // Inline thread-search (t3code SidebarV2): ComposerInput row.
-        // New Thread (t3code SidebarV2): the compose glyph summons the same
-        // searchable project selector, anchored beneath this row; picking a
-        // project opens a fresh session targeting it. Sits OUTSIDE the
-        // search pill, mirroring the New Project button's placement.
+        // New Thread (t3code SidebarV2): the compose glyph opens a fresh
+        // session in the current space. Sits OUTSIDE the search pill,
+        // mirroring the New Project button's placement.
         let new_thread_button = div()
             .id("new-thread-button")
             .flex_none()
@@ -4225,12 +4224,12 @@ impl Shell {
             .justify_center()
             .cursor_pointer()
             .on_hover(motion::hover_listener("new-thread-btn"))
-            .on_click(cx.listener(|this, _, window, cx| {
-                this.open_spaces_menu(
-                    spaces::SpacesMenuPurpose::NewThread,
-                    window,
-                    cx,
-                );
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.route = Route::Chat;
+                this.state.update(cx, |s, cx| {
+                    s.select_chat(None, cx);
+                });
+                cx.notify();
             }))
             .child(
                 crate::icons::icon(crate::icons::PEN_NEW_SQUARE)

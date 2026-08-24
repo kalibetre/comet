@@ -3233,27 +3233,50 @@ fn mention_token(text: &str, cursor: usize) -> Option<MentionToken> {
     })
 }
 
-/// The `/` must open the input: slash commands are whole-prompt prefixes
-/// (`/compact`, `/goal ship it`), so only the first token triggers, and a
-/// query containing another `/` (a typed path) never does.
+/// Slash-command token detection: a `/` opens the command popup. The `/`
+/// must be either the first character of the input or preceded by whitespace
+/// (so `please /compact` works, but paths like `a/b` don't). A query
+/// containing another `/` (a typed path mid-token) never triggers. The
+/// cursor must sit within the command token (not past its trailing space).
 fn slash_token(text: &str, cursor: usize) -> Option<MentionToken> {
-    if cursor > text.len() || !text.is_char_boundary(cursor) || !text.starts_with('/') {
+    if cursor > text.len() || !text.is_char_boundary(cursor) || text.is_empty() {
         return None;
     }
-    let end = text
+    // Find the last `/` at or before the cursor that starts a token (beginning
+    // of text or preceded by whitespace). None → no command.
+    let before_cursor = &text[..cursor];
+    let Some(slash_at) = before_cursor
         .char_indices()
-        .find_map(|(at, ch)| ch.is_whitespace().then_some(at))
+        .rev()
+        .find_map(|(at, ch)| {
+            (ch == '/').then_some(at)
+        })
+    else {
+        return None;
+    };
+    // The `/` must be the first char or follow whitespace.
+    if slash_at != 0 {
+        let prev = text[..slash_at].chars().next_back()?;
+        if !prev.is_whitespace() {
+            return None;
+        }
+    }
+    // End of the command token: next whitespace after the `/`, or end of text.
+    let after_slash = slash_at + 1;
+    let end = text[after_slash..]
+        .char_indices()
+        .find_map(|(at, ch)| ch.is_whitespace().then_some(after_slash + at))
         .unwrap_or(text.len());
     // Cursor outside the command token (typing the argument): popup closed.
     if cursor == 0 || cursor > end {
         return None;
     }
-    let query = &text[1..cursor];
+    let query = &text[after_slash..cursor];
     if query.contains('/') {
         return None;
     }
     Some(MentionToken {
-        range: 0..end,
+        range: slash_at..end,
         query: query.to_string(),
     })
 }
@@ -3352,6 +3375,9 @@ pub struct Composer {
     /// Advertised commands per harness (one `ListCommands` per harness per
     /// composer lifetime; the engine caches discovery on its side too).
     slash_cache: HashMap<HarnessId, Vec<SlashCommand>>,
+    /// Scroll handle for the slash-command popup — drives scroll-into-view
+    /// when keyboard navigation moves the active row.
+    slash_scroll: gpui::ScrollHandle,
     current_key: String,
     sending: bool,
     failure: Option<SharedString>,
@@ -3504,6 +3530,7 @@ impl Composer {
             slash_task: None,
             slash: SlashState::default(),
             slash_cache: HashMap::new(),
+            slash_scroll: gpui::ScrollHandle::new(),
             current_key,
             sending: false,
             failure: None,
@@ -4099,8 +4126,10 @@ impl Composer {
 
     // ---- slash commands ---------------------------------------------------
 
-    /// Track the `/` token on every edit: open/refresh the popup, fetch the
-    /// harness's command list on first open, filter locally per keystroke.
+    /// Track the `/` token on every edit: open/refresh the popup, filter the
+    /// (prefetched) command list locally per keystroke. Command discovery is
+    /// kicked off eagerly by [`Self::prefetch_slash_commands`] the moment a
+    /// harness resolves — so the cache is warm before the user types `/`.
     fn update_slash(&mut self, text: &str, cursor: usize, cx: &mut Context<Self>) {
         let token = slash_token(text, cursor);
         let still_dismissed = token.as_ref().is_some_and(|token| {
@@ -4123,6 +4152,9 @@ impl Composer {
         self.slash.token = token.clone();
         self.slash.harness = harness;
         self.slash.error = None;
+        // Reset scroll so a fresh token (or harness change) starts at the
+        // top, not wherever the previous popup was scrolled.
+        self.slash_scroll.set_offset(gpui::Point::default());
         if token.is_none() {
             self.slash.active = None;
             self.sync_mention_controls(cx);
@@ -4134,16 +4166,26 @@ impl Composer {
             self.refilter_slash(cx);
             return;
         };
-        if self.slash_cache.contains_key(&harness) {
+        if self.slash_cache.contains_key(&harness) || self.slash.loading {
             self.slash.loading = false;
             self.refilter_slash(cx);
             return;
         }
-        // First open for this harness: one ListCommands, targeted like file
-        // search (the chat/space host device owns the agent binary).
+        // Cache miss and not already fetching: trigger the fetch (this also
+        // runs proactively from `prefetch_slash_commands`).
+        self.prefetch_slash_commands(harness, cx);
+    }
+
+    /// Eagerly fetch the harness's command list so the cache is warm before
+    /// the user types `/`. Called when a harness first resolves and on cache
+    /// miss. Idempotent: a pending request (matching `self.slash.request`)
+    /// suppresses duplicate fetches.
+    fn prefetch_slash_commands(&mut self, harness: HarnessId, cx: &mut Context<Self>) {
+        if self.slash_cache.contains_key(&harness) || self.slash.loading {
+            return;
+        }
         self.slash.request = self.slash.request.wrapping_add(1);
         self.slash.loading = true;
-        self.refilter_slash(cx);
         let Some(engine) = self.state.read(cx).engine().cloned() else {
             self.slash.loading = false;
             return;
@@ -4208,8 +4250,14 @@ impl Composer {
     }
 
     fn move_slash(&mut self, delta: isize, cx: &mut Context<Self>) {
+        let previous = self.slash.active;
         self.slash.active =
             crate::popover::menu_step(self.slash.active, self.slash.filtered.len(), delta);
+        if self.slash.active != previous {
+            if let Some(active) = self.slash.active {
+                self.slash_scroll.scroll_to_item(active);
+            }
+        }
         self.sync_mention_controls(cx);
         cx.notify();
     }
@@ -4277,9 +4325,11 @@ impl Composer {
             .map(Vec::as_slice)
             .unwrap_or_default();
         let mut card = crate::popover::popover_card(theme)
+            .id("slash-popup-scroll")
             .w(px(380.0))
             .max_h(px(280.0))
-            .overflow_hidden()
+            .overflow_y_scroll()
+            .track_scroll(&self.slash_scroll)
             .on_mouse_down_out(cx.listener(|this, _, _, cx| this.dismiss_slash(cx)));
         if self.slash.loading && commands.is_empty() {
             card = card.child(crate::popover::skeleton_rows(
@@ -4387,6 +4437,12 @@ impl Composer {
                 pending_input_request(&s.transcript),
             )
         };
+
+        // Prefetch slash commands the moment a harness resolves so the cache
+        // is warm before the user types `/`.
+        if let Some(harness) = self.pickers.read(cx).resolved(cx).harness {
+            self.prefetch_slash_commands(harness, cx);
+        }
 
         // Draft swap on chat navigation — the input entity itself survives.
         if key != self.current_key {
@@ -6204,7 +6260,8 @@ mod tests {
     }
 
     #[test]
-    fn slash_token_only_opens_the_prompt() {
+    fn slash_token_triggers_on_slash_anywhere_after_whitespace() {
+        // Classic: `/` at the very start.
         assert_eq!(
             slash_token("/comp", 5),
             Some(MentionToken {
@@ -6220,8 +6277,25 @@ mod tests {
                 query: "co".into(),
             })
         );
-        // Not at offset 0 → prose, not a command.
-        assert!(slash_token("run /compact", 12).is_none());
+        // `/` after whitespace mid-text → now a command (range is the slash
+        // token, query is the typed suffix).
+        assert_eq!(
+            slash_token("run /compact", 12),
+            Some(MentionToken {
+                range: 4..12,
+                query: "compact".into(),
+            })
+        );
+        // `/` after whitespace, cursor mid-command.
+        assert_eq!(
+            slash_token("run /compact", 7),
+            Some(MentionToken {
+                range: 4..12,
+                query: "co".into(),
+            })
+        );
+        // `/` NOT preceded by whitespace (mid-word) → not a command.
+        assert!(slash_token("a/b", 3).is_none());
         // Cursor past the command word (typing the argument) → closed.
         assert!(slash_token("/goal ship it", 10).is_none());
         // A typed absolute path is not a command.
